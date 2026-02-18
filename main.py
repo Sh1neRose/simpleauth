@@ -1,6 +1,7 @@
 from fastapi import FastAPI, APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr, field_validator, ValidationInfo
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session, relationship
+from sqlalchemy.sql.functions import sum
 from sqlalchemy import create_engine, select, ForeignKey, DateTime, Numeric
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -16,10 +17,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-engine = create_engine("sqlite:///data.db", echo=True)
 PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
 PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
 SECRET_KEY = os.getenv("SECRET_KEY")
+
+engine = create_engine("sqlite:///data.db", echo=True)
 security = HTTPBearer()
 
 class Base(DeclarativeBase):
@@ -38,8 +40,7 @@ def get_session():
     with new_session() as session:
         yield session
 
-SessionDep = Annotated[Session, Depends(get_session)]
-
+#Models
 class User(Base):
     __tablename__ = "users"
 
@@ -48,24 +49,40 @@ class User(Base):
     password: Mapped[str]
     email: Mapped[str]
 
-    transactions: Mapped[list["Transactions"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    transactions: Mapped[list["Transaction"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    orders: Mapped[list["Order"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
-class Transactions(Base):
+class Transaction(Base):
     __tablename__ = "transactions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
-    order_id: Mapped[str] = mapped_column(unique=True)
     amount: Mapped[float] = mapped_column(Numeric(12, 2))
-    status: Mapped[str] = mapped_column(default="CREATED")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(tz=timezone.utc),
         nullable=False,
     )
 
-    user: Mapped["User"] = relationship(back_populates="transactions") 
+    user: Mapped["User"] = relationship(back_populates="transactions")
 
+class Order(Base):
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    order_id: Mapped[str] = mapped_column(unique=True)
+    status: Mapped[str] = mapped_column(default="CREATED")
+    amount: Mapped[float] = mapped_column(Numeric(12, 2))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(tz=timezone.utc),
+        nullable=False,
+    )
+
+    user: Mapped["User"] = relationship(back_populates="orders")
+
+#Schemas
 class UserLoginSchema(BaseModel):
     username: str
     password1: str
@@ -108,8 +125,6 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
-
-GetCurrentUserDep = Annotated[User, Depends(get_current_user)]
 
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
@@ -156,6 +171,11 @@ def get_paypal_access_token():
         payload = response.json()
         return payload["access_token"]
 
+#Dep
+SessionDep = Annotated[Session, Depends(get_session)]
+GetCurrentUserDep = Annotated[User, Depends(get_current_user)]
+
+#Endpoints
 user_router = APIRouter()
 
 @app.get("/")
@@ -190,14 +210,22 @@ def login_required(user: GetCurrentUserDep):
 
 @user_router.post("/get_token")
 def get_token(data: UserLoginSchema, session: SessionDep):
-    queary = select(User).where(User.username == data.username)
-    user = session.execute(queary).scalar_one_or_none()
+    query = select(User).where(User.username == data.username)
+    user = session.execute(query).scalar_one_or_none()
     if not user or not verify_password(data.password1, user.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return {"token": encode_user(user)}
 
+@user_router.get("/get_balance")
+def get_user_balance(user: GetCurrentUserDep, session: SessionDep):
+    query = session.query(sum(Transaction.amount)).where(Transaction.user_id==user.id)
+    result = session.execute(query).scalar_one_or_none()
+    if result:
+        return {"balance": result}
+    return {"balance": 0,}
+
 @app.post("/create_order")
-def create_order(data: CreateOrderSchema):
+def create_order(data: CreateOrderSchema, user: GetCurrentUserDep, session: SessionDep):
     ACCESS_TOKEN = get_paypal_access_token()
     headers = {
     "Content-Type": "application/json",
@@ -221,7 +249,14 @@ def create_order(data: CreateOrderSchema):
             json=json,
                 )
         response.raise_for_status()
-    payload = response.json()
+        payload = response.json()
+    order = Order(
+        user_id=user.id,
+        order_id=payload["id"],
+        amount=data.value,
+    )
+    session.add(order)
+    session.commit()
     for link in payload["links"]:
         if link["rel"] == "approve":
             return {
@@ -230,7 +265,7 @@ def create_order(data: CreateOrderSchema):
                 }
 
 @app.post("/capture_order")
-def capture_order(data: CaptureOrderSchema):
+def capture_order(data: CaptureOrderSchema, session: SessionDep):
     ACCESS_TOKEN = get_paypal_access_token()
     headers = {
         "Content-Type": "application/json",
@@ -238,6 +273,33 @@ def capture_order(data: CaptureOrderSchema):
     }
     with httpx.Client() as client:
         response = client.post(f"https://api-m.sandbox.paypal.com/v2/checkout/orders/{data.order_id}/capture", headers=headers)
-    payload = response.json()
+        payload = response.json()
+    if payload["status"] == "COMPLETED":
+        order = session.execute(select(Order).where(Order.order_id==data.order_id)).scalar_one_or_none()
+        if not order:
+            raise HTTPException(404, detail="Order not found")
+        order.status = "COMPLETED"
+
+        transaction = Transaction(
+            user_id=order.user_id,
+            amount=order.amount,
+        )
+
+        session.add(transaction)
+        session.commit()
+
+    return payload
+
+@app.get("/get_orders")
+def get_orders(session: SessionDep):
+    query = select(Order)
+    result = session.execute(query)
+    return result.scalars().all()
+
+@app.get("/get_transactions")
+def get_transactions(session: SessionDep):
+    query = select(Transaction)
+    result = session.execute(query)
+    return result.scalars().all()
 
 app.include_router(user_router, prefix="/user")
